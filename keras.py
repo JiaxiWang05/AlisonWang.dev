@@ -13,3 +13,5 @@ model.add(layers.Dense(1, activation="sigmoid")) # Output layer
 # Add the output layer with 1 neuron.
 # 'sigmoid' is used for binary classification (predicting 0 or 1).
 # In this structure, you simply .add() layers in the order you want the data to flow through them
+# Compile the Keras model
+model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
