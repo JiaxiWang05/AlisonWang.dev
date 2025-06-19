@@ -1,0 +1,170 @@
+import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.model_selection import train_test_split
+
+# Load and prepare data
+df = pd.read_csv('/content/data.csv')
+print(f"Dataset shape: {df.shape}")
+
+# Prepare input/output data
+structural_params = df.iloc[:, :8]  # First 8 columns are structural parameters
+spectral_data = df.iloc[:, 8:]      # Remaining columns are spectral data
+
+# One-hot encode categorical structural parameters if needed
+structural_params = pd.get_dummies(structural_params, dtype=float)
+print(f"Structural params shape: {structural_params.shape}")
+print(f"Spectral data shape: {spectral_data.shape}")
+
+# Convert to numpy arrays and normalize
+X_struct = np.array(structural_params)  # Structural parameters
+Y_spectral = np.array(spectral_data)    # Spectral responses
+
+# Normalize spectral data to [0,1] if not already
+Y_spectral = (Y_spectral - Y_spectral.min()) / (Y_spectral.max() - Y_spectral.min())
+
+# Split data properly
+X_train, X_temp, Y_train, Y_temp = train_test_split(
+    X_struct, Y_spectral, test_size=0.4, random_state=42)
+X_val, X_test, Y_val, Y_test = train_test_split(
+    X_temp, Y_temp, test_size=0.5, random_state=42)
+
+print(f"Training set: {X_train.shape}, {Y_train.shape}")
+print(f"Validation set: {X_val.shape}, {Y_val.shape}")
+print(f"Test set: {X_test.shape}, {Y_test.shape}")
+
+# Load pre-trained SNN (Forward Model)
+SNN_model = keras.models.load_model('/content/drive/MyDrive/L2 Practical Course/SNN_Model.keras')
+
+# Freeze SNN parameters
+for layer in SNN_model.layers:
+    layer.trainable = False
+
+print("SNN Model loaded and frozen:")
+SNN_model.summary()
+
+# Build improved IDNN architecture
+def build_idnn(input_dim, output_dim):
+    """Build Inverse Design Neural Network with improved architecture"""
+    
+    inputs = keras.Input(shape=(input_dim,), name='spectral_input')
+    
+    # Batch normalization for input stability
+    x = keras.layers.BatchNormalization()(inputs)
+    
+    # Gradually decreasing layer sizes (following paper recommendations)
+    x = keras.layers.Dense(1000, name='dense_1')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    
+    x = keras.layers.Dense(1000, name='dense_2')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    
+    x = keras.layers.Dense(1000, name='dense_3')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    x = keras.layers.Dropout(0.02)(x)  # 2% dropout as per paper
+    
+    x = keras.layers.Dense(500, name='dense_4')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    x = keras.layers.Dropout(0.01)(x)  # 1% dropout as per paper
+    
+    x = keras.layers.Dense(500, name='dense_5')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    
+    x = keras.layers.Dense(500, name='dense_6')(x)
+    x = keras.layers.LeakyReLU(negative_slope=0.1)(x)
+    
+    # Output layer with sigmoid to bound parameters to [0,1]
+    outputs = keras.layers.Dense(output_dim, activation='sigmoid', name='structure_output')(x)
+    
+    return keras.Model(inputs=inputs, outputs=outputs, name='IDNN')
+
+# Create IDNN
+spectral_dim = Y_spectral.shape[1]  # 351 in your case
+structural_dim = X_struct.shape[1]   # Your structural parameters dimension
+
+idnn_model = build_idnn(spectral_dim, structural_dim)
+print("IDNN Architecture:")
+idnn_model.summary()
+
+# Build Tandem Network
+def build_tandem_network(idnn, snn):
+    """Build complete tandem network"""
+    spectral_input = keras.Input(shape=(spectral_dim,), name='target_spectrum')
+    
+    # IDNN predicts structure from spectrum
+    predicted_structure = idnn(spectral_input)
+    
+    # SNN predicts spectrum from predicted structure  
+    predicted_spectrum = snn(predicted_structure)
+    
+    # Complete tandem model
+    tandem = keras.Model(
+        inputs=spectral_input,
+        outputs=predicted_spectrum,
+        name='TandemNetwork'
+    )
+    
+    return tandem
+
+# Create tandem network
+tandem_model = build_tandem_network(idnn_model, SNN_model)
+
+# Compile with improved settings
+tandem_model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss='mse',
+    metrics=['mae']
+)
+
+print("Tandem Network:")
+tandem_model.summary()
+
+# Enhanced callbacks
+callbacks = [
+    keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss', factor=0.1, patience=6, min_lr=1e-7, verbose=1
+    ),
+    keras.callbacks.EarlyStopping(
+        monitor='val_loss', patience=10, restore_best_weights=True, verbose=1
+    ),
+    keras.callbacks.ModelCheckpoint(
+        'best_tandem_model.keras', save_best_only=True, monitor='val_loss'
+    )
+]
+
+# Train tandem network (CORRECTED: spectral data as both input and target)
+print("Training Tandem Network...")
+history = tandem_model.fit(
+    Y_train, Y_train,  # Spectral data as both input and target
+    epochs=50,
+    batch_size=32,
+    validation_data=(Y_val, Y_val),
+    callbacks=callbacks,
+    verbose=1
+)
+
+# Evaluate model
+test_loss, test_mae = tandem_model.evaluate(Y_test, Y_test, verbose=0)
+print(f"Test Loss: {test_loss:.6f}")
+print(f"Test MAE: {test_mae:.6f}")
+
+# Calculate accuracy as per paper
+def calculate_accuracy(y_true, y_pred):
+    """Calculate accuracy as defined in the paper"""
+    N = len(y_true)
+    accuracies = []
+    
+    for i in range(N):
+        y_avg = np.mean(y_true[i])
+        if y_avg > 0:
+            accuracy = 1 - np.mean(np.abs(y_pred[i] - y_true[i])) / y_avg
+            accuracies.append(max(0, accuracy))  # Ensure non-negative
+    
+    return np.mean(accuracies) * 100
+
+# Test accuracy
+y_pred = tandem_model.predict(Y_test)
+accuracy = calculate_accuracy(Y_test, y_pred)
+print(f"Model Accuracy: {accuracy:.1f}%")
